@@ -1,39 +1,44 @@
-import JSZip from 'jszip';
-import { saveAs } from 'file-saver';
+import pLimit from "p-limit";
+import streamSaver from "streamsaver";
+import { saveAs } from "file-saver";
+import createZipWriter from "@/lib/zip-stream";
+
+// 配置 StreamSaver mitm URL (用于支持旧浏览器)
+if (typeof window !== "undefined") {
+  streamSaver.mitm =
+    "https://jimmywarting.github.io/StreamSaver.js/mitm.html?version=2.0.0";
+}
 
 const downloadImage = async (url: string): Promise<Blob> => {
   try {
     const response = await fetch(url, {
-      method: 'GET',
-      mode: 'cors',
-      cache: 'no-store'
+      method: "GET",
+      mode: "cors",
+      cache: "no-store",
     });
 
     if (!response.ok) {
       throw new Error(`下载失败: ${response.status} ${response.statusText}`);
     }
 
-    const blob = await response.blob();
-    return blob;
+    return await response.blob();
   } catch (error) {
     console.error(`下载图片 ${url} 失败:`, error);
     throw error;
   }
 };
 
-
+// 从URL提取文件名
 const getFileNameFromUrl = (url: string): string => {
-  // url template ../rc_gen_image/*********.jpeg~tplv-****-image_raw.png?rcl=....
   try {
     const urlObj = new URL(url);
     const pathname = urlObj.pathname;
-    const fileName = pathname.split('/').pop() || 'image';
-    return fileName
+    const fileName = pathname.split("/").pop() || "image";
+    return fileName;
   } catch {
     return `image_${Date.now()}`;
   }
 };
-
 
 interface DownloadOptions {
   zipName?: string;
@@ -42,26 +47,97 @@ interface DownloadOptions {
 }
 
 /**
- * 下载图片列表并打包为ZIP，如果是单个图片，则直接下载
- * @param imageUrls 图片URL数组
- * @param options 下载配置
+ * streamsaver + zip-stream
+ * @param imageUrls 图片列表
+ * @param zipName 压缩包名称
+ * @param onProgress 进度回调
+ * @param onError 错误回调
  */
+const createZipStreamWithZipStreamLib = async (
+  imageUrls: string[],
+  zipName: string,
+  onProgress: (current: number, total: number) => void,
+  onError: (url: string, error: Error) => void
+): Promise<void> => {
+  const total = imageUrls.length;
+  let completed = 0;
+
+  const fileStream = streamSaver.createWriteStream(`${zipName}.zip`);
+  const writer = fileStream.getWriter();
+
+  const zipReadableStream = createZipWriter({
+    async start(zipWriter) {
+      
+      const concurrency = 5;
+      const limit = pLimit(concurrency);
+
+      const downloadPromises = imageUrls.map((url) =>
+        limit(async () => {
+          try {
+            const blob = await downloadImage(url);
+            const fileName = getFileNameFromUrl(url);
+            return { url, fileName, blob, success: true as const };
+          } catch (error) {
+            onError(url, error as Error);
+            return { url, fileName: "", blob: null, success: false as const };
+          }
+        })
+      );
+
+      const downloadResults = await Promise.all(downloadPromises);
+
+      for (const result of downloadResults) {
+        if (result.success && result.blob) {
+          const imageStream = result.blob.stream();
+
+          zipWriter.enqueue({
+            name: result.fileName,
+            lastModified: Date.now(),
+            directory: false,
+            stream: () => imageStream,
+          });
+
+          completed++;
+          onProgress(completed, total);
+        }
+      }
+
+      zipWriter.close();
+    },
+  });
+
+  try {
+    const reader = zipReadableStream.getReader();
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      await writer.write(value);
+    }
+
+    await writer.close();
+  } catch (error) {
+    console.error("ZIP打包或下载失败:", error);
+    await writer.abort();
+    throw error;
+  }
+};
+
 const downloadImagesAsZip = async (
   imageUrls: string[],
   options: DownloadOptions = {}
 ): Promise<void> => {
   const {
-    zipName = 'images',
+    zipName = "images",
     onProgress = () => {},
-    onError = () => {}
+    onError = () => {},
   } = options;
 
   if (!imageUrls.length) {
-    console.warn('没有需要下载的图片');
+    console.warn("没有需要下载的图片");
     return;
   }
 
-  // 单张图片直接下载
+  // 单张图片直接用file-saver下载
   if (imageUrls.length === 1) {
     try {
       const url = imageUrls[0];
@@ -75,42 +151,16 @@ const downloadImagesAsZip = async (
     return;
   }
 
-  const zip = new JSZip();
-  const total = imageUrls.length;
-  let completed = 0;
-
-  const concurrency = 5; // 同时下载的图片数量
-  const chunks: string[][] = [];
-  
-  for (let i = 0; i < total; i += concurrency) {
-    chunks.push(imageUrls.slice(i, i + concurrency));
-  }
-
+  // 多张图片使用streamsaver+zip-stream打包下载
   try {
-    for (const chunk of chunks) {
-      const promises = chunk.map(async (url) => {
-        try {
-          const blob = await downloadImage(url);
-          const fileName = getFileNameFromUrl(url);
-        
-          zip.file(fileName, blob);
-          
-          completed++;
-          onProgress(completed, total);
-        } catch (error) {
-          onError(url, error as Error);
-        }
-      });
-      await Promise.all(promises);
-    }
-
-    const content = await zip.generateAsync(
-      { type: 'blob' },
+    await createZipStreamWithZipStreamLib(
+      imageUrls,
+      zipName,
+      onProgress,
+      onError
     );
-
-    saveAs(content, `${zipName}.zip`);
   } catch (error) {
-    console.error('打包ZIP失败:', error);
+    console.error("批量下载失败:", error);
     throw error;
   }
 };
